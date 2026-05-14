@@ -20,9 +20,9 @@ name: APEX Strategy Signal
 on:
   schedule:
     - cron: '0 0 * * 1'       # Sunday 8 PM ET   → Mon 00:00 UTC  (weekly signal)
-    - cron: '0 13 * * 1'      # Monday 9 AM ET   → Mon 13:00 UTC  (pre-market confirm)
-    - cron: '0 14 * * 1'      # Monday 10 AM ET  → Mon 14:00 UTC  (execution window)
-    - cron: '0 13 * * 2-5'    # Tue–Fri 9 AM ET  → 13:00 UTC      (daily confirm)
+    - cron: '2 13 * * 1'      # Monday 9 AM ET   → Mon 13:00 UTC  (pre-market confirm)
+    - cron: '58 13 * * 1'      # Monday 10 AM ET  → Mon 14:00 UTC  (execution window)
+    - cron: '2 13 * * 2-5'    # Tue–Fri 9 AM ET  → 13:00 UTC      (daily confirm)
     - cron: '15 20 * * 1-5'   # Mon–Fri 4:15 PM ET → 20:15 UTC    (after-close stop check)
   workflow_dispatch:           # manual trigger from GitHub UI
 
