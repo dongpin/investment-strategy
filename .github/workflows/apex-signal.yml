@@ -150,7 +150,17 @@ jobs:
               f.write(f"trail={trail}\n")
           PYEOF
 
-      # ── 6. Send email ─────────────────────────────────────────────
+      # ── 6. Read report into output variable ──────────────────────
+      - name: Read report body
+        id: report
+        run: |
+          {
+            echo 'body<<REPORTEOF'
+            cat /tmp/apex_report.txt
+            echo 'REPORTEOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # ── 7. Send email ─────────────────────────────────────────────
       - name: Send email notification
         uses: dawidd6/action-send-mail@v3
         with:
@@ -162,4 +172,4 @@ jobs:
           subject: ${{ steps.meta.outputs.subject }}
           to: dongpin@hotmail.com
           from: APEX Strategy <${{ secrets.GMAIL_USER }}>
-          body_filepath: /tmp/apex_report.txt
+          body: ${{ steps.report.outputs.body }}
