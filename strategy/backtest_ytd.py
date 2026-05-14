@@ -1,8 +1,13 @@
 """
 APEX Strategy — YTD Backtest Engine
 =====================================
-Replays APEX signals day-by-day from Jan 1 of the current year using
-actual historical prices. Compares against buy-and-hold VOO, QQQ, TQQQ.
+Replays APEX v1, v2, and v3 (Layer 0) signals day-by-day from Jan 1 of the
+current year using actual historical prices. Compares against buy-and-hold
+VOO, QQQ, TQQQ.
+
+Layer 0 historical data comes from FRED (Corporate Profits / GDP).
+The regime is updated quarterly with a 1-quarter data-release lag to
+avoid look-ahead bias.
 
 Usage:
     python backtest_ytd.py
@@ -14,6 +19,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import sys
+from io import StringIO
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -24,7 +30,118 @@ except ImportError:
     print("pip install yfinance pandas numpy matplotlib")
     raise
 
-from apex_strategy import CONFIG
+try:
+    import requests as _requests
+    _REQUESTS_OK = True
+except ImportError:
+    _REQUESTS_OK = False
+
+from apex_strategy import (
+    CONFIG,
+    REGIME_DEFINITIONS,
+    MARGIN_SCORES,
+)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  LAYER 0 — HISTORICAL REGIME  (FRED CP/GDP)
+# ══════════════════════════════════════════════════════════════════
+
+# YoY/QoQ thresholds (percentage-point change in CP/GDP ratio)
+_YOY_THRESH = [(2.0,"MAJOR_EXPANSION"),(0.5,"EXPANSION"),(-0.5,"FLAT"),
+               (-2.0,"CONTRACTION"),(None,"MAJOR_CONTRACTION")]
+_QOQ_THRESH = [(1.0,"MAJOR_EXPANSION"),(0.3,"EXPANSION"),(-0.3,"FLAT"),
+               (-1.0,"CONTRACTION"),(None,"MAJOR_CONTRACTION")]
+
+
+def _classify(change_pp: float, thresholds: list) -> str:
+    for thresh, label in thresholds:
+        if thresh is None or change_pp >= thresh:
+            return label
+    return "N/A"
+
+
+def fetch_fred_margin_history() -> pd.DataFrame:
+    """
+    Download FRED CP and GDP, compute quarterly profit-margin proxy (CP/GDP×100),
+    classify YoY and QoQ direction.  Returns quarterly DataFrame.
+    Falls back to empty DataFrame on any network error.
+    """
+    if not _REQUESTS_OK:
+        return pd.DataFrame()
+    try:
+        def _dl(sid):
+            url  = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
+            resp = _requests.get(url, timeout=20)
+            resp.raise_for_status()
+            s = pd.read_csv(StringIO(resp.text), parse_dates=[0], index_col=0)
+            s.columns = [sid]
+            return pd.to_numeric(s[sid], errors="coerce").dropna()
+
+        cp  = _dl("CP")
+        gdp = _dl("GDP")
+        df  = pd.DataFrame({"cp": cp, "gdp": gdp}).dropna()
+        df["margin"]   = df["cp"] / df["gdp"] * 100
+        df["yoy_chg"]  = df["margin"] - df["margin"].shift(4)
+        df["qoq_chg"]  = df["margin"] - df["margin"].shift(1)
+        df["dir_yoy"]  = df["yoy_chg"].apply(
+            lambda x: _classify(float(x), _YOY_THRESH) if not pd.isna(x) else "N/A"
+        )
+        df["dir_qoq"]  = df["qoq_chg"].apply(
+            lambda x: _classify(float(x), _QOQ_THRESH) if not pd.isna(x) else "N/A"
+        )
+        return df
+    except Exception as e:
+        print(f"    ⚠  Layer 0 FRED fetch failed ({e}) — using NEUTRAL for all quarters")
+        return pd.DataFrame()
+
+
+def build_regime_series(fred_df: pd.DataFrame,
+                        trading_index: pd.DatetimeIndex,
+                        cape_thresh: float = 35.0) -> pd.Series:
+    """
+    Convert quarterly FRED margin data to a daily regime-params Series.
+
+    Timing: FRED quarterly data is released ~2 months after quarter-end
+    (BEA advance estimate).  We apply a 1-quarter lag to the signal to
+    avoid look-ahead bias: e.g. Q4 data (released ~Feb) is available and
+    used from the start of the *next* quarter (April 1).
+
+    Returns a pd.Series of regime-param dicts, indexed by trading date.
+    """
+    if fred_df.empty:
+        default = REGIME_DEFINITIONS["NEUTRAL"].copy()
+        return pd.Series([default] * len(trading_index), index=trading_index)
+
+    # Shift by 1 quarter (data release lag)
+    fred_lagged = fred_df.copy()
+    fred_lagged.index = fred_lagged.index + pd.DateOffset(months=3)
+
+    # Build daily regime series
+    params_list = []
+    for date in trading_index:
+        available = fred_lagged[fred_lagged.index <= date]
+        if available.empty:
+            regime = "NEUTRAL"
+        else:
+            row  = available.iloc[-1]
+            yoy  = row.get("dir_yoy", "N/A")
+            qoq  = row.get("dir_qoq", "N/A")
+            s    = MARGIN_SCORES.get(yoy, 0) + MARGIN_SCORES.get(qoq, 0) // 2
+            # CAPE correction: use cape_thresh as rough proxy.
+            # Full historical CAPE not fetched; threshold applied from 2018
+            # (CAPE reliably exceeded 35 from ~2018 onwards).
+            if date.year >= 2018:
+                s -= 1
+            if s >= 3:
+                regime = "EXPANSION"
+            elif s <= -2:
+                regime = "CONTRACTION"
+            else:
+                regime = "NEUTRAL"
+        params_list.append(REGIME_DEFINITIONS[regime].copy())
+
+    return pd.Series(params_list, index=trading_index)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -276,6 +393,9 @@ def compute_signal(row: pd.Series, cfg: dict) -> float:
         if tqqq_p < tqqq_h * cfg["trail_pct"]:
             return 0.0
 
+    # ── Layer 0: max_alloc cap ───────────────────────────────────
+    alloc = min(alloc, cfg.get("max_alloc", 1.0))
+
     return round(min(alloc, 1.0), 4)
 
 
@@ -357,6 +477,91 @@ def run_backtest_v1(ind: pd.DataFrame, ytd_start: pd.Timestamp) -> pd.DataFrame:
         return round(min(alloc, 1.0), 4)
 
     return run_backtest(ind, cfg_v1, ytd_start, signal_fn=signal_v1)
+
+
+def run_backtest_v3(ind: pd.DataFrame, cfg: dict, ytd_start: pd.Timestamp,
+                    fred_df: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    APEX v3.0: v2 signals + Layer 0 macro regime (historical FRED data).
+
+    Each trading day, the regime-adjusted cfg overrides:
+        vix_threshold, dd_threshold, target_vol, max_alloc
+    Layer 2 scoring is identical to v2.
+    """
+    if fred_df is None or fred_df.empty:
+        print("    Layer 0: no FRED data — running v3 same as v2 (NEUTRAL regime)")
+
+    ytd = ind[ind.index >= ytd_start].copy()
+    regime_series = build_regime_series(
+        fred_df if fred_df is not None else pd.DataFrame(),
+        ytd.index
+    )
+
+    def signal_v3(row, regime_params):
+        cfg_r = cfg.copy()
+        cfg_r["vix_threshold"] = regime_params["vix_threshold"]
+        cfg_r["dd_threshold"]  = regime_params["dd_threshold"]
+        cfg_r["target_vol"]    = regime_params["target_vol"]
+        cfg_r["max_alloc"]     = regime_params.get("max_alloc", 1.0)
+        return compute_signal(row, cfg_r)
+
+    nav   = 1.0
+    alloc = 0.0
+    results = []
+
+    tqqq_series = ytd["tqqq"].dropna()
+    voo_series  = ytd["voo"].dropna()
+    prev_tqqq   = tqqq_series.iloc[0] if len(tqqq_series) else 1.0
+    prev_voo    = voo_series.iloc[0]  if len(voo_series)  else 1.0
+
+    for i, (date, row) in enumerate(ytd.iterrows()):
+        regime_params = regime_series.loc[date]
+        if i == 0:
+            alloc = signal_v3(row, regime_params)
+            results.append({"date": date, "apex_nav": nav,
+                            "tqqq_alloc": alloc, "voo_alloc": 1 - alloc,
+                            "regime": _regime_label(regime_params)})
+            if not pd.isna(row.get("tqqq", float("nan"))): prev_tqqq = row["tqqq"]
+            if not pd.isna(row.get("voo",  float("nan"))): prev_voo  = row["voo"]
+            continue
+
+        tqqq_p_now = row["tqqq"] if not pd.isna(row.get("tqqq", float("nan"))) else prev_tqqq
+        voo_p_now  = row["voo"]  if not pd.isna(row.get("voo",  float("nan"))) else prev_voo
+        tqqq_ret   = (tqqq_p_now / prev_tqqq - 1) if (prev_tqqq and prev_tqqq > 0) else 0.0
+        voo_ret    = (voo_p_now  / prev_voo  - 1) if (prev_voo  and prev_voo  > 0) else 0.0
+        nav        = nav * (1 + alloc * tqqq_ret + (1 - alloc) * voo_ret)
+
+        new_alloc = signal_v3(row, regime_params) if date.weekday() == 0 else alloc
+
+        tqqq_p = row.get("tqqq"); tqqq_h = row.get("tqqq_trail_high")
+        if (tqqq_p is not None and tqqq_h is not None and
+                not pd.isna(tqqq_p) and not pd.isna(tqqq_h)):
+            if float(tqqq_p) < float(tqqq_h) * cfg["trail_pct"]:
+                new_alloc = 0.0
+
+        alloc = new_alloc
+        results.append({"date": date, "apex_nav": nav,
+                        "tqqq_alloc": alloc, "voo_alloc": 1 - alloc,
+                        "regime": _regime_label(regime_params)})
+        prev_tqqq = tqqq_p_now
+        prev_voo  = voo_p_now
+
+    bt = pd.DataFrame(results).set_index("date")
+    for col, asset in [("voo_nav","voo"),("tqqq_nav","tqqq"),
+                       ("qqq_nav","qqq"),("qld_nav","qld")]:
+        prices  = ytd[asset]
+        base_ix = prices.first_valid_index()
+        bt[col] = (prices / prices.loc[base_ix]).reindex(bt.index) if base_ix else float("nan")
+
+    return bt
+
+
+def _regime_label(regime_params: dict) -> str:
+    """Reverse-lookup regime label from params dict."""
+    for label, params in REGIME_DEFINITIONS.items():
+        if params == regime_params:
+            return label
+    return "NEUTRAL"
 
 
 def run_backtest(ind: pd.DataFrame, cfg: dict, ytd_start: pd.Timestamp,
@@ -604,71 +809,139 @@ def main():
     print("⚙️   Computing indicators …")
     ind = build_indicators(data, cfg)
 
-    # 3. Run both versions
-    print(f"🔁  Simulating APEX v1 (original) …")
+    # 3. Fetch Layer 0 historical FRED data
+    print("📡  Fetching FRED margin history for Layer 0 …")
+    fred_df = fetch_fred_margin_history()
+
+    # 4. Run all three versions
+    print("🔁  Simulating APEX v1 (original, 4 hard stops) …")
     bt_v1 = run_backtest_v1(ind, ytd_start)
-    print(f"🔁  Simulating APEX v2 (improved) …")
+    print("🔁  Simulating APEX v2 (improved) …")
     bt_v2 = run_backtest(ind, cfg, ytd_start)
+    print("🔁  Simulating APEX v3 (v2 + Layer 0 macro regime) …")
+    bt_v3 = run_backtest_v3(ind, cfg, ytd_start, fred_df=fred_df)
 
-    # Share benchmarks from v2 bt
-    bt_v1["voo_nav"]  = bt_v2["voo_nav"]
-    bt_v1["tqqq_nav"] = bt_v2["tqqq_nav"]
-    bt_v1["qqq_nav"]  = bt_v2["qqq_nav"]
-    bt_v1["qld_nav"]  = bt_v2["qld_nav"]
+    # Share benchmarks from v2
+    for bt in [bt_v1, bt_v3]:
+        bt["voo_nav"]  = bt_v2["voo_nav"]
+        bt["tqqq_nav"] = bt_v2["tqqq_nav"]
+        bt["qqq_nav"]  = bt_v2["qqq_nav"]
+        bt["qld_nav"]  = bt_v2["qld_nav"]
 
-    # 4. Metrics
-    print(f"\n{'═'*72}")
+    # 5. Metrics
+    print(f"\n{'═'*76}")
     print(f"  APEX Strategy — YTD {year} Backtest  "
           f"(through {bt_v2.index[-1].strftime('%Y-%m-%d')}, "
           f"{len(bt_v2)} trading days)")
-    print(f"{'═'*72}\n")
+    print(f"{'═'*76}\n")
 
     v1_m   = metrics(bt_v1["apex_nav"], "APEX v1.0 (original)")
-    v2_m   = metrics(bt_v2["apex_nav"], "APEX v2.0 (improved) ◀")
+    v2_m   = metrics(bt_v2["apex_nav"], "APEX v2.0")
+    v3_m   = metrics(bt_v3["apex_nav"], "APEX v3.0 (Layer 0) ◀")
     voo_m  = metrics(bt_v2["voo_nav"],  "Buy & Hold VOO")
     tqqq_m = metrics(bt_v2["tqqq_nav"], "Buy & Hold TQQQ")
     qqq_m  = metrics(bt_v2["qqq_nav"],  "Buy & Hold QQQ  ← target")
     qld_m  = metrics(bt_v2["qld_nav"],  "Buy & Hold QLD")
 
-    all_metrics = [v2_m, v1_m, voo_m, qqq_m, qld_m, tqqq_m]
+    all_metrics = [v3_m, v2_m, v1_m, voo_m, qqq_m, qld_m, tqqq_m]
     print_metrics_table(all_metrics)
 
-    print(f"\n  v2 vs v1 CAGR delta:   {v2_m['cagr']-v1_m['cagr']:+.1%}")
-    print(f"  v2 vs QQQ CAGR delta:  {v2_m['cagr']-qqq_m['cagr']:+.1%}")
-    print(f"  v2 Sharpe vs VOO:      {v2_m['sharpe']-voo_m['sharpe']:+.2f}")
+    print(f"\n  v3 vs v2 CAGR delta:   {v3_m['cagr']-v2_m['cagr']:+.1%}")
+    print(f"  v3 vs v1 CAGR delta:   {v3_m['cagr']-v1_m['cagr']:+.1%}")
+    print(f"  v3 vs QQQ CAGR delta:  {v3_m['cagr']-qqq_m['cagr']:+.1%}")
 
-    # v2 changes summary
-    print(f"\n  v2 changes applied:")
-    print(f"    1. EMA death cross removed from Layer 1 (now Layer-2 -4 only)")
-    print(f"    2. VIX momentum (5d Δ) added as 9th scoring dimension")
-    print(f"    3. Dynamic vol target: 25% when score≥5 & VIX<20 (else 20%)")
-    print(f"    4. alloc_map score=6 raised from 85% → 90%")
+    # Layer 0 regime summary for the YTD period
+    if "regime" in bt_v3.columns:
+        print(f"\n  Layer 0 regime breakdown (YTD {year}):")
+        regime_counts = bt_v3["regime"].value_counts()
+        for r, n in regime_counts.items():
+            print(f"    {r:<14}  {n:>4} trading days  "
+                  f"({n/len(bt_v3)*100:.0f}%)")
 
-    # 5. Allocation timeline (v2)
-    print_monthly_allocations(bt_v2)
-    print(f"\n  v1 vs v2 monthly TQQQ allocation:")
-    print(f"  {'Month':<10} {'v1':>6} {'v2':>6} {'delta':>8}")
-    print("  " + "─" * 34)
-    for period in bt_v2["tqqq_alloc"].resample("ME").mean().index:
-        end = period
-        mask = bt_v2.index.to_period("M") == period.to_period("M")
-        a1 = bt_v1["tqqq_alloc"][mask].mean()
+    # 6. Allocation timeline (v3 vs v2)
+    print_monthly_allocations(bt_v3)
+    print(f"\n  v2 vs v3 monthly TQQQ allocation:")
+    print(f"  {'Month':<10} {'v2':>6} {'v3':>6} {'delta':>8}  {'Regime'}")
+    print("  " + "─" * 46)
+    for period in bt_v3["tqqq_alloc"].resample("ME").mean().index:
+        mask = bt_v3.index.to_period("M") == period.to_period("M")
         a2 = bt_v2["tqqq_alloc"][mask].mean()
-        print(f"  {period.strftime('%Y-%m'):<10} {a1:>5.0%} {a2:>6.0%} {a2-a1:>+7.0%}")
+        a3 = bt_v3["tqqq_alloc"][mask].mean()
+        reg = bt_v3["regime"][mask].mode()[0] if "regime" in bt_v3.columns else "—"
+        print(f"  {period.strftime('%Y-%m'):<10} {a2:>5.0%} {a3:>6.0%} "
+              f"{a3-a2:>+7.0%}  {reg}")
 
-    print_regime_changes(bt_v2)
+    print_regime_changes(bt_v3)
 
-    # 6. Optional plot
+    # 7. Optional plot
     if do_plot:
-        # Add v1 NAV to v2 df for comparison
-        bt_v2["apex_v1_nav"] = bt_v1["apex_nav"].values
-        plot_results(bt_v2, year)
+        bt_v3["apex_v2_nav"] = bt_v2["apex_nav"].values
+        bt_v3["apex_v1_nav"] = bt_v1["apex_nav"].values
+        _plot_v3(bt_v3, year)
     else:
         print("\n  Tip: run with --plot to generate a comparison chart")
 
-    print(f"\n{'═'*72}\n")
+    print(f"\n{'═'*76}\n")
 
-    return bt_v2, all_metrics
+    return bt_v3, all_metrics
+
+
+def _plot_v3(bt: pd.DataFrame, year: int) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+    except ImportError:
+        print("matplotlib not available — skip plot")
+        return
+
+    fig, axes = plt.subplots(3, 1, figsize=(13, 10),
+                             gridspec_kw={"height_ratios": [3, 1.2, 1]})
+    fig.suptitle(f"APEX Strategy v3.0 — YTD {year} Backtest", fontsize=14, fontweight="bold")
+
+    ax = axes[0]
+    ax.plot(bt.index, bt["apex_nav"], label="APEX v3.0 (Layer 0)", color="#E91E63", lw=2.5, zorder=6)
+    if "apex_v2_nav" in bt.columns:
+        ax.plot(bt.index, bt["apex_v2_nav"], label="APEX v2.0", color="#2196F3", lw=1.8, ls="--", zorder=5)
+    if "apex_v1_nav" in bt.columns:
+        ax.plot(bt.index, bt["apex_v1_nav"], label="APEX v1.0", color="#90CAF9", lw=1.2, ls=":", zorder=4)
+    ax.plot(bt.index, bt["voo_nav"],  label="VOO",  color="#4CAF50", lw=1.5, ls="--")
+    ax.plot(bt.index, bt["tqqq_nav"], label="TQQQ", color="#F44336", lw=1.5, ls=":")
+    ax.plot(bt.index, bt["qqq_nav"],  label="QQQ",  color="#9C27B0", lw=1.2, ls="-.", alpha=0.7)
+    ax.set_ylabel("Portfolio NAV (start = 1.0)")
+    ax.legend(loc="upper left", fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+    ax.set_title("Cumulative Returns", fontsize=11)
+
+    ax2 = axes[1]
+    ax2.fill_between(bt.index, bt["tqqq_alloc"], alpha=0.7, color="#E91E63", label="TQQQ % v3")
+    if "apex_v2_nav" in bt.columns:
+        pass  # v2 alloc not stored in bt; skip overlay
+    ax2.set_ylim(0, 1.05)
+    ax2.set_ylabel("TQQQ Weight")
+    ax2.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
+    ax2.set_yticklabels(["0%", "25%", "50%", "75%", "100%"])
+    ax2.legend(loc="upper left", fontsize=9)
+    ax2.grid(True, alpha=0.3)
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+    ax2.set_title("APEX v3 TQQQ Allocation", fontsize=11)
+
+    ax3 = axes[2]
+    dd_apex = (bt["apex_nav"] / bt["apex_nav"].cummax() - 1) * 100
+    dd_voo  = (bt["voo_nav"]  / bt["voo_nav"].cummax()  - 1) * 100
+    ax3.fill_between(bt.index, dd_apex, 0, alpha=0.5, color="#E91E63", label="APEX v3 DD")
+    ax3.fill_between(bt.index, dd_voo,  0, alpha=0.3, color="#4CAF50", label="VOO DD")
+    ax3.set_ylabel("Drawdown (%)")
+    ax3.legend(loc="lower left", fontsize=9)
+    ax3.grid(True, alpha=0.3)
+    ax3.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+    ax3.set_title("Drawdown", fontsize=11)
+
+    plt.tight_layout()
+    out_path = f"backtest_ytd_{year}.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"\n  📈 Chart saved → {out_path}")
+    plt.show()
 
 
 if __name__ == "__main__":

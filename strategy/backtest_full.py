@@ -29,6 +29,8 @@ from backtest_ytd import (
     compute_signal,
     run_backtest,
     run_backtest_v1,
+    run_backtest_v3,
+    fetch_fred_margin_history,
     metrics,
     CONFIG,
 )
@@ -128,81 +130,81 @@ def print_summary_table(results: list[dict], initial: float = 100_000) -> None:
     print(f"  {'─'*26}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*12}")
 
 
-def print_yearly_table(bt_v2: pd.DataFrame, bt_v1: pd.DataFrame,
-                       benchmarks: dict) -> None:
+def print_yearly_table(bt_v3: pd.DataFrame, bt_v2: pd.DataFrame,
+                       bt_v1: pd.DataFrame, benchmarks: dict) -> None:
+    yr_v3   = yearly_stats(bt_v3["apex_nav"])
     yr_v2   = yearly_stats(bt_v2["apex_nav"])
     yr_v1   = yearly_stats(bt_v1["apex_nav"])
     yr_voo  = yearly_stats(bt_v2["voo_nav"])
     yr_qqq  = yearly_stats(bt_v2["qqq_nav"])
     yr_tqqq = yearly_stats(bt_v2["tqqq_nav"])
-    alloc   = avg_alloc_by_year(bt_v2)
+    alloc   = avg_alloc_by_year(bt_v3)
 
     current_year = datetime.now().year
 
-    print(f"\n{'═'*100}")
+    print(f"\n{'═'*110}")
     print(f"  Year-by-Year Returns")
-    print(f"{'═'*100}")
-    hdr = (f"  {'Year':<6} {'APEX v2':>9} {'APEX v1':>9} "
+    print(f"{'═'*110}")
+    hdr = (f"  {'Year':<6} {'APEX v3':>9} {'APEX v2':>9} {'APEX v1':>9} "
            f"{'VOO':>8} {'QQQ':>8} {'TQQQ':>8}  "
-           f"{'v2 MaxDD':>9} {'v1 MaxDD':>9}  {'Avg TQQQ%':>10}")
+           f"{'v3 MaxDD':>9} {'v2 MaxDD':>9}  {'Avg TQQQ%':>10}")
     print(hdr)
-    print("  " + "─" * 97)
+    print("  " + "─" * 108)
 
-    for yr in sorted(set(yr_v2.index) | set(yr_v1.index)):
+    for yr in sorted(set(yr_v3.index) | set(yr_v2.index)):
         tag  = " *" if yr == current_year else "  "
-        r_v2 = yr_v2["return"].get(yr,  float("nan"))
-        r_v1 = yr_v1["return"].get(yr,  float("nan"))
+        r_v3   = yr_v3["return"].get(yr,  float("nan"))
+        r_v2   = yr_v2["return"].get(yr,  float("nan"))
+        r_v1   = yr_v1["return"].get(yr,  float("nan"))
         r_voo  = yr_voo["return"].get(yr,  float("nan"))
         r_qqq  = yr_qqq["return"].get(yr,  float("nan"))
         r_tqqq = yr_tqqq["return"].get(yr, float("nan"))
+        dd_v3  = yr_v3["max_dd"].get(yr,  float("nan"))
         dd_v2  = yr_v2["max_dd"].get(yr,  float("nan"))
-        dd_v1  = yr_v1["max_dd"].get(yr,  float("nan"))
         avg_a  = alloc.get(yr, float("nan"))
 
-        def fmt(v, bold=False):
-            if np.isnan(v):
-                return f"{'—':>8}"
-            s = f"{v:>+8.1%}"
-            return s
+        def fmt(v):
+            return f"{'—':>8}" if np.isnan(v) else f"{v:>+8.1%}"
 
-        # Color-code winner between v2 and v1
-        winner = "v2" if (not np.isnan(r_v2) and not np.isnan(r_v1)
-                          and r_v2 >= r_v1) else "v1"
-        marker = ">" if winner == "v2" else " "
+        # Mark the best performing version (v3 vs v2)
+        marker = ">" if (not np.isnan(r_v3) and not np.isnan(r_v2)
+                         and r_v3 >= r_v2) else " "
 
         print(
             f"  {yr}{tag:<3} "
-            f"{fmt(r_v2):>9}{marker} "
+            f"{fmt(r_v3):>9}{marker} "
+            f"{fmt(r_v2):>9}  "
             f"{fmt(r_v1):>9}  "
             f"{fmt(r_voo):>8}  "
             f"{fmt(r_qqq):>8}  "
             f"{fmt(r_tqqq):>8}  "
+            f"{dd_v3:>+9.1%}  "
             f"{dd_v2:>+9.1%}  "
-            f"{dd_v1:>+9.1%}  "
             f"{avg_a:>9.0%}"
         )
 
-    print("  " + "─" * 97)
+    print("  " + "─" * 108)
     print(f"  * = YTD (partial year)")
 
-    # Win/loss count
-    wins_v2, wins_v1, ties = 0, 0, 0
-    for yr in sorted(yr_v2.index):
-        if yr not in yr_v1.index:
+    # Win/loss count v3 vs v2
+    wins_v3, wins_v2, ties = 0, 0, 0
+    for yr in sorted(yr_v3.index):
+        if yr not in yr_v2.index:
             continue
-        d = yr_v2["return"][yr] - yr_v1["return"][yr]
-        if d > 0.001:   wins_v2 += 1
-        elif d < -0.001: wins_v1 += 1
+        d = yr_v3["return"][yr] - yr_v2["return"][yr]
+        if d > 0.001:    wins_v3 += 1
+        elif d < -0.001: wins_v2 += 1
         else:            ties    += 1
-    print(f"\n  v2 beat v1:  {wins_v2} years   "
-          f"v1 beat v2:  {wins_v1} years   ties: {ties}")
+    print(f"\n  v3 beat v2:  {wins_v3} years   "
+          f"v2 beat v3:  {wins_v2} years   ties: {ties}")
 
 
 # ══════════════════════════════════════════════════════════════════
 #  PLOT
 # ══════════════════════════════════════════════════════════════════
 
-def plot_full(bt_v2: pd.DataFrame, bt_v1: pd.DataFrame) -> None:
+def plot_full(bt_v3: pd.DataFrame, bt_v2: pd.DataFrame,
+             bt_v1: pd.DataFrame = None) -> None:
     try:
         import matplotlib.pyplot as plt
         import matplotlib.ticker as mticker
@@ -218,10 +220,13 @@ def plot_full(bt_v2: pd.DataFrame, bt_v1: pd.DataFrame) -> None:
 
     # ── Panel 1: Log-scale NAV ──────────────────────────────────
     ax = axes[0]
+    ax.semilogy(bt_v3.index, bt_v3["apex_nav"],  label="APEX v3.0 (Layer 0)",
+                color="#E91E63", lw=2.5, zorder=7)
     ax.semilogy(bt_v2.index, bt_v2["apex_nav"],  label="APEX v2.0",
-                color="#1565C0", lw=2.5, zorder=6)
-    ax.semilogy(bt_v2.index, bt_v1["apex_nav"],  label="APEX v1.0",
-                color="#90CAF9", lw=1.5, ls="--", zorder=5)
+                color="#1565C0", lw=1.8, ls="--", zorder=6)
+    if bt_v1 is not None:
+        ax.semilogy(bt_v2.index, bt_v1["apex_nav"],  label="APEX v1.0",
+                    color="#90CAF9", lw=1.2, ls=":", zorder=5)
     ax.semilogy(bt_v2.index, bt_v2["voo_nav"],   label="VOO",
                 color="#2E7D32", lw=1.5, ls="--")
     ax.semilogy(bt_v2.index, bt_v2["qqq_nav"],   label="QQQ",
@@ -271,10 +276,10 @@ def plot_full(bt_v2: pd.DataFrame, bt_v1: pd.DataFrame) -> None:
 
     # ── Panel 3: TQQQ allocation heatmap ────────────────────────
     ax3 = axes[2]
+    ax3.fill_between(bt_v3.index, bt_v3["tqqq_alloc"],
+                     alpha=0.7, color="#E91E63", label="TQQQ % (v3)")
     ax3.fill_between(bt_v2.index, bt_v2["tqqq_alloc"],
-                     alpha=0.7, color="#1565C0", label="TQQQ % (v2)")
-    ax3.fill_between(bt_v2.index, bt_v1["tqqq_alloc"],
-                     alpha=0.35, color="#90CAF9", label="TQQQ % (v1)")
+                     alpha=0.35, color="#1565C0", label="TQQQ % (v2)")
     ax3.set_ylim(0, 1.05)
     ax3.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
     ax3.set_yticklabels(["0%", "25%", "50%", "75%", "100%"])
@@ -461,28 +466,37 @@ def main():
     print("⚙️   Computing indicators …")
     ind  = build_indicators(data, CONFIG)
 
-    # 3. Run both versions from BACKTEST_START
+    # 3. Fetch Layer 0 historical FRED data
+    print("📡  Fetching FRED margin history for Layer 0 …")
+    fred_df = fetch_fred_margin_history()
+
+    # 4. Run all three versions from BACKTEST_START
     print(f"🔁  Simulating APEX v1.0 from {BACKTEST_START.date()} …")
     bt_v1 = run_backtest_v1(ind, BACKTEST_START)
 
     print(f"🔁  Simulating APEX v2.0 from {BACKTEST_START.date()} …")
     bt_v2 = run_backtest(ind, CONFIG, BACKTEST_START)
 
-    # Align v1 benchmarks from v2
-    bt_v1["voo_nav"]  = bt_v2["voo_nav"]
-    bt_v1["tqqq_nav"] = bt_v2["tqqq_nav"]
-    bt_v1["qqq_nav"]  = bt_v2["qqq_nav"]
-    bt_v1["qld_nav"]  = bt_v2["qld_nav"]
+    print(f"🔁  Simulating APEX v3.0 (Layer 0) from {BACKTEST_START.date()} …")
+    bt_v3 = run_backtest_v3(ind, CONFIG, BACKTEST_START, fred_df=fred_df)
 
-    # 4. Full-period metrics
+    # Align benchmarks from v2
+    for bt in [bt_v1, bt_v3]:
+        bt["voo_nav"]  = bt_v2["voo_nav"]
+        bt["tqqq_nav"] = bt_v2["tqqq_nav"]
+        bt["qqq_nav"]  = bt_v2["qqq_nav"]
+        bt["qld_nav"]  = bt_v2["qld_nav"]
+
+    # 5. Full-period metrics
     initial = 100_000
     results = [
-        full_metrics(bt_v2["apex_nav"],  "APEX v2.0 (improved)", initial),
-        full_metrics(bt_v1["apex_nav"],  "APEX v1.0 (original)", initial),
-        full_metrics(bt_v2["voo_nav"],   "Buy & Hold VOO",        initial),
-        full_metrics(bt_v2["qqq_nav"],   "Buy & Hold QQQ",        initial),
-        full_metrics(bt_v2["qld_nav"],   "Buy & Hold QLD",        initial),
-        full_metrics(bt_v2["tqqq_nav"],  "Buy & Hold TQQQ",       initial),
+        full_metrics(bt_v3["apex_nav"],  "APEX v3.0 (Layer 0)",   initial),
+        full_metrics(bt_v2["apex_nav"],  "APEX v2.0",             initial),
+        full_metrics(bt_v1["apex_nav"],  "APEX v1.0 (original)",  initial),
+        full_metrics(bt_v2["voo_nav"],   "Buy & Hold VOO",         initial),
+        full_metrics(bt_v2["qqq_nav"],   "Buy & Hold QQQ",         initial),
+        full_metrics(bt_v2["qld_nav"],   "Buy & Hold QLD",         initial),
+        full_metrics(bt_v2["tqqq_nav"],  "Buy & Hold TQQQ",        initial),
     ]
 
     print(f"\n{'═'*80}")
@@ -493,14 +507,14 @@ def main():
     print(f"{'═'*80}")
     print_summary_table(results, initial)
 
-    # 5. Yearly breakdown
-    print_yearly_table(bt_v2, bt_v1, {})
+    # 6. Yearly breakdown (v3 vs v2 vs v1)
+    print_yearly_table(bt_v3, bt_v2, bt_v1, {})
 
-    # 6. Realistic simulation (gap analysis)
-    print(f"\n🔁  Simulating APEX v2.0 realistic (3-day confirm + slippage) …")
+    # 7. Realistic simulation (gap analysis on v3)
+    print(f"\n🔁  Simulating APEX v3.0 realistic (3-day confirm + slippage) …")
     bt_real = run_realistic(ind, CONFIG, BACKTEST_START)
-    results.insert(2, full_metrics(bt_real["real_nav"], "APEX v2.0 (realistic)", initial))
-    gap_analysis(bt_v2, bt_real)
+    results.insert(2, full_metrics(bt_real["real_nav"], "APEX v3.0 (realistic)", initial))
+    gap_analysis(bt_v3, bt_real)
 
     # 7. Drawdown analysis
     print(f"\n{'─'*60}")
@@ -524,28 +538,29 @@ def main():
         ("2022 bear",     "2021-11-19", "2022-12-28"),
     ]
     for name, s, e in bear_periods:
-        mask = (bt_v2.index >= s) & (bt_v2.index <= e)
+        mask = (bt_v3.index >= s) & (bt_v3.index <= e)
         if mask.sum() < 5:
             continue
         def period_ret(nav, m): return nav[m].iloc[-1]/nav[m].iloc[0] - 1
+        rv3   = period_ret(bt_v3["apex_nav"], mask)
         rv2   = period_ret(bt_v2["apex_nav"], mask)
         rv1   = period_ret(bt_v1["apex_nav"], mask)
         rvoo  = period_ret(bt_v2["voo_nav"],  mask)
         rtqqq = period_ret(bt_v2["tqqq_nav"], mask)
         rqqq  = period_ret(bt_v2["qqq_nav"],  mask)
         print(f"\n  {name} ({s} → {e}):")
-        print(f"    APEX v2: {rv2:+.1%}   APEX v1: {rv1:+.1%}   "
+        print(f"    APEX v3: {rv3:+.1%}   APEX v2: {rv2:+.1%}   APEX v1: {rv1:+.1%}   "
               f"VOO: {rvoo:+.1%}   QQQ: {rqqq:+.1%}   TQQQ: {rtqqq:+.1%}")
 
     # 8. Optional plot
     if do_plot:
-        plot_full(bt_v2, bt_v1)
+        plot_full(bt_v3, bt_v2, bt_v1)
     else:
         print("\n  Tip: run with --plot for the 3-panel 15-year chart")
 
     print(f"\n{'═'*80}\n")
-    return bt_v2, bt_v1, results
+    return bt_v3, bt_v2, bt_v1, results
 
 
 if __name__ == "__main__":
-    bt_v2, bt_v1, results = main()
+    bt_v3, bt_v2, bt_v1, results = main()

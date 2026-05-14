@@ -1,0 +1,165 @@
+name: APEX Strategy Signal
+
+# ── Schedule ────────────────────────────────────────────────────────────────
+# All times UTC. US Eastern (EDT = UTC-4, Nov-Mar EST = UTC-5).
+#
+#  Sunday  20:00 ET  (Mon 00:00 UTC)   Weekly planning signal
+#  Mon       9:00 ET  (Mon 13:00 UTC EDT)      Pre-market: confirm before execution
+#  Mon      10:00 ET  (Mon 14:00 UTC EDT)      Execution window opens — act on signal
+#  Tue–Fri   9:00 ET  (Tue–Fri 13:00 UTC EDT)  Daily pre-market confirmation check
+#  Mon–Fri  16:15 ET  (Mon–Fri 20:15 UTC EDT)  After-close: trailing stop check
+#
+# Why these slots:
+#   1. Sunday PM   → full weekly signal; plan Monday allocation before markets open
+#   2. Monday 9 AM → confirm signal matches Sunday; verify VIX / trailing stop
+#   3. Monday 10 AM → execution window: act if allocation change > 5% (limit orders)
+#   4. Tue–Fri 9 AM → daily confirmation tracking for mid-week entries/exits
+#   5. Daily 4:15 PM → trailing stop fires intraday; catch same-day triggers before close
+# ────────────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'       # Sunday 8 PM ET   → Mon 00:00 UTC  (weekly signal)
+    - cron: '0 13 * * 1'      # Monday 9 AM ET   → Mon 13:00 UTC  (pre-market confirm)
+    - cron: '0 14 * * 1'      # Monday 10 AM ET  → Mon 14:00 UTC  (execution window)
+    - cron: '0 13 * * 2-5'    # Tue–Fri 9 AM ET  → 13:00 UTC      (daily confirm)
+    - cron: '15 20 * * 1-5'   # Mon–Fri 4:15 PM ET → 20:15 UTC    (after-close stop check)
+  workflow_dispatch:           # manual trigger from GitHub UI
+
+jobs:
+  apex-signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 3. Layer 0: refresh FRED margin data (quarterly, idempotent) ──
+      - name: Refresh Layer 0 margin snapshot
+        working-directory: strategy
+        run: python sp500_margin_tracker.py --save
+        continue-on-error: true   # FRED can be flaky; fall back to NEUTRAL regime
+
+      # ── 4. Run strategy and capture full report ───────────────────
+      - name: Run APEX strategy
+        working-directory: strategy
+        run: python apex_strategy.py 2>&1 | tee /tmp/apex_report.txt
+
+      # ── 5. Parse signal for subject line ─────────────────────────
+      - name: Parse signal metadata
+        id: meta
+        working-directory: strategy
+        run: |
+          python - <<'PYEOF'
+          import subprocess, json, re, os, sys
+          from datetime import datetime, timezone
+
+          result = subprocess.run(
+              [sys.executable, "apex_strategy.py", "--json"],
+              capture_output=True, text=True
+          )
+          # The JSON block is at the end of stdout; find it by scanning for the
+          # opening brace of the outermost object that contains "tqqq_pct"
+          data = {}
+          decoder = json.JSONDecoder()
+          for i, ch in enumerate(result.stdout):
+              if ch == '{':
+                  try:
+                      obj, _ = decoder.raw_decode(result.stdout, i)
+                      if "tqqq_pct" in obj:
+                          data = obj
+                          break
+                  except json.JSONDecodeError:
+                      pass
+
+          tqqq     = data.get("tqqq_pct", 0)
+          score    = data.get("score", "?")
+          regime   = data.get("regime", "NEUTRAL")
+          reason   = data.get("reason", "")
+          circuit  = data.get("circuit_triggered", False)
+          trail    = data.get("trail_stop_fired", False)
+          vol_cap  = data.get("vol_cap", 1.0)
+
+          # Determine run context from weekday + UTC hour
+          now = datetime.now(timezone.utc)
+          dow, hour = now.weekday(), now.hour   # Mon=0 … Sun=6
+          if dow == 0 and hour < 3:
+              context = "Weekly Signal"
+          elif dow == 0 and hour == 13:
+              context = "Pre-Market Confirm"
+          elif dow == 0 and hour == 14:
+              context = "⚡ EXECUTION WINDOW"
+          elif hour == 13:
+              context = "Pre-Market Check"
+          else:
+              context = "After-Close Check"
+
+          # Emoji + status — emergency always overrides
+          if circuit or trail:
+              alert_line = (
+                  "\n" + "!"*68 + "\n"
+                  "  *** EMERGENCY EXIT — ACT IMMEDIATELY ***\n"
+                  + ("  Circuit breaker triggered.\n" if circuit else "")
+                  + ("  Trailing stop triggered.\n" if trail else "")
+                  + "  Log in to Fidelity NOW and exit TQQQ → VOO.\n"
+                  "!"*68 + "\n"
+              )
+              emoji, status = "🚨🚨🚨", "EMERGENCY EXIT — ACT NOW"
+          else:
+              alert_line = ""
+              if tqqq == 0:
+                  emoji, status = "🔴", "DEFENSIVE — 100% VOO"
+              elif tqqq >= 0.60:
+                  emoji, status = "🟢", "BULLISH"
+              elif tqqq >= 0.30:
+                  emoji, status = "🟡", "MODERATE"
+              else:
+                  emoji, status = "🟡", "CAUTIOUS"
+
+          date_str = now.strftime("%Y-%m-%d %a")
+          subject  = (
+              f"{emoji} APEX {context} {date_str} | "
+              f"{int(tqqq*100)}% TQQQ / {int((1-tqqq)*100)}% VOO | "
+              f"Score {score:+} | {regime} | {status}"
+          )
+
+          # Prepend alert banner to report file if emergency
+          if alert_line:
+              with open("/tmp/apex_report.txt", "r") as f:
+                  body = f.read()
+              with open("/tmp/apex_report.txt", "w") as f:
+                  f.write(alert_line + body + alert_line)
+
+          out_file = os.environ["GITHUB_OUTPUT"]
+          with open(out_file, "a") as f:
+              f.write(f"subject={subject}\n")
+              f.write(f"tqqq_pct={int(tqqq*100)}\n")
+              f.write(f"circuit={circuit}\n")
+              f.write(f"trail={trail}\n")
+          PYEOF
+
+      # ── 6. Send email ─────────────────────────────────────────────
+      - name: Send email notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          subject: ${{ steps.meta.outputs.subject }}
+          to: dongpin@hotmail.com
+          from: APEX Strategy <${{ secrets.GMAIL_USER }}>
+          body_filepath: /tmp/apex_report.txt

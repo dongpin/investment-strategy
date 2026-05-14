@@ -1,0 +1,12 @@
+{
+  "direction_yoy": "FLAT",
+  "direction_qoq": "EXPANSION",
+  "margin_latest": 12.0684,
+  "margin_yoy_prev": 12.3703,
+  "margin_qoq_prev": 11.5485,
+  "yoy_change_pp": -0.3019,
+  "qoq_change_pp": 0.52,
+  "as_of_quarter": "2025-10-01",
+  "data_source": "FRED CP/GDP (Corporate Profits After Tax / GDP, SAAR)",
+  "updated_at": "2026-05-13T22:51:13.067929"
+}

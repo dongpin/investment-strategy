@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                                                                      ║
-║   APEX Strategy  v2.0                                                ║
+║   APEX Strategy  v3.0                                                ║
 ║   Adaptive Position EXecution Protocol                               ║
 ║                                                                      ║
 ║   A volatility-targeted, signal-scored rotation system               ║
@@ -9,10 +9,11 @@
 ║                                                                      ║
 ║   Designed for: Roth IRA  |  Weekly rebalance  |  Long-term hold    ║
 ║                                                                      ║
-║   Core mechanics:                                                    ║
-║     Layer 1 — Hard circuit breakers (3 conditions)                  ║
+║   Four-layer architecture:                                           ║
+║     Layer 0 — Macro regime (quarterly: EXPANSION/NEUTRAL/CONTRACTION)║
+║     Layer 1 — Hard circuit breakers (regime-adjusted thresholds)    ║
 ║     Layer 2 — 10-dimension signal scoring → continuous allocation    ║
-║     Layer 3 — Volatility targeting (dynamic 20–25% vol budget)      ║
+║     Layer 3 — Volatility targeting (regime-adjusted vol budget)      ║
 ║     Addon   — TQQQ trailing stop (15-day high × 92%)                ║
 ║                                                                      ║
 ║   Backtest (2010–2026, Roth IRA, no taxes):                         ║
@@ -24,10 +25,14 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 
 Usage:
-    pip install yfinance pandas numpy
+    pip install yfinance pandas numpy requests
     python apex_strategy.py
 
+    # Update Layer 0 each quarter (after Jan/Apr/Jul/Oct BEA release):
+    python sp500_margin_tracker.py --save
+
 Outputs:
+    • Layer 0 macro regime + current parameters
     • Current allocation recommendation (TQQQ% / VOO%)
     • All signal scores with explanations
     • Trailing stop check
@@ -37,9 +42,12 @@ Outputs:
 import warnings
 warnings.filterwarnings("ignore")
 
+import os
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 try:
     import yfinance as yf
@@ -99,7 +107,7 @@ CONFIG = {
     "trail_pct"      : 0.92,     # exit if price < high × this value (−8%)
 
     # Execution
-    "confirm_days"   : 3,        # signal must persist N days before acting
+    "confirm_days"   : 2,        # signal must persist N days before acting
     "exec_delay"     : 1,        # T+1 execution (days after signal)
 
     # Data download
@@ -108,6 +116,88 @@ CONFIG = {
     "tnx_period"     : "4mo",
     "tqqq_period"    : "2mo",
 }
+
+
+# ══════════════════════════════════════════════════════════════════
+#  LAYER 0 — MACRO REGIME  (quarterly update)
+# ══════════════════════════════════════════════════════════════════
+#
+#  Reads the quarterly S&P 500 profit margin snapshot produced by
+#  sp500_margin_tracker.py and combines it with Shiller CAPE to
+#  determine a macro regime: EXPANSION / NEUTRAL / CONTRACTION.
+#
+#  The regime modifies Layer 1 and Layer 3 risk parameters.
+#  Layer 2 scoring is completely unchanged.
+#
+#  Update CAPE_RATIO manually each quarter.
+#  Run `python sp500_margin_tracker.py --save` to refresh the margin file.
+
+CAPE_RATIO  = 37.0    # Shiller CAPE — update manually each quarter
+MARGIN_SNAP = os.path.join(_REPO_ROOT, "sp500_output", "sp500_margin_latest.json")
+
+# Regime → risk parameters
+REGIME_DEFINITIONS = {
+    "EXPANSION"  : {"target_vol": 0.22, "vix_threshold": 28,
+                    "dd_threshold": -12, "max_alloc": 1.0},
+    "NEUTRAL"    : {"target_vol": 0.20, "vix_threshold": 25,
+                    "dd_threshold": -10, "max_alloc": 1.0},
+    "CONTRACTION": {"target_vol": 0.16, "vix_threshold": 22,
+                    "dd_threshold":  -8, "max_alloc": 0.5},
+}
+
+# Margin direction → Layer 0 score contribution
+MARGIN_SCORES = {
+    "MAJOR_EXPANSION":  4,
+    "EXPANSION":        2,
+    "FLAT":             0,
+    "CONTRACTION":     -2,
+    "MAJOR_CONTRACTION":-4,
+    "N/A":              0,
+}
+
+
+def get_regime_params(cape: float = CAPE_RATIO,
+                      margin_file: str = MARGIN_SNAP) -> tuple:
+    """
+    Compute the Layer 0 macro regime from the quarterly margin snapshot + CAPE.
+
+    Scoring:
+        s  = MARGIN_SCORES[yoy]  +  MARGIN_SCORES[qoq] // 2
+        s -= 1  if CAPE > 35
+
+    Regime mapping:
+        s >= 3  → EXPANSION   (loosen risk params)
+        s <= -2 → CONTRACTION (tighten risk params; cap TQQQ at 50%)
+        else    → NEUTRAL     (default params)
+
+    Returns (regime_params_dict, regime_label).
+    Falls back to NEUTRAL if the margin file is missing.
+    """
+    try:
+        import json as _json
+        snap = _json.load(open(margin_file))
+        yoy  = snap.get("direction_yoy", "N/A")
+        qoq  = snap.get("direction_qoq", "N/A")
+    except Exception:
+        yoy, qoq = "N/A", "N/A"   # file missing → default to NEUTRAL
+
+    s = MARGIN_SCORES.get(yoy, 0) + MARGIN_SCORES.get(qoq, 0) // 2
+    if cape > 35:
+        s -= 1
+
+    if s >= 3:
+        regime = "EXPANSION"
+    elif s <= -2:
+        regime = "CONTRACTION"
+    else:
+        regime = "NEUTRAL"
+
+    return REGIME_DEFINITIONS[regime], regime
+
+
+# Computed once at import time; re-run script or call get_regime_params()
+# after updating the margin JSON or CAPE_RATIO.
+REGIME_PARAMS, CURRENT_REGIME = get_regime_params()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -559,9 +649,20 @@ def run_apex(cfg: dict = None, verbose: bool = True) -> dict:
         final_alloc: final allocation (= tqqq_pct)
         circuit_triggered : bool
         trail_stop_fired  : bool
+        regime     : current Layer 0 macro regime label
     """
     if cfg is None:
         cfg = CONFIG
+
+    # ── Layer 0: Load macro regime and override risk parameters ────
+    # This modifies vix_threshold, dd_threshold, target_vol, and adds
+    # max_alloc.  Layer 2 scoring is completely unaffected.
+    regime_params, regime_label = get_regime_params()
+    cfg = cfg.copy()
+    cfg["vix_threshold"] = regime_params["vix_threshold"]
+    cfg["dd_threshold"]  = regime_params["dd_threshold"]
+    cfg["target_vol"]    = regime_params["target_vol"]
+    cfg["max_alloc"]     = regime_params.get("max_alloc", 1.0)
 
     # 1. Fetch data
     data = fetch_data(cfg)
@@ -585,12 +686,16 @@ def run_apex(cfg: dict = None, verbose: bool = True) -> dict:
     ts = check_trailing_stop(ind, cfg)
 
     # 8. Final allocation
+    max_alloc = cfg.get("max_alloc", 1.0)
     if cb["triggered"]:
         final_alloc = 0.0
         reason = "LAYER 1 CIRCUIT BREAKER"
     elif ts["fired"]:
         final_alloc = 0.0
         reason = "TRAILING STOP"
+    elif max_alloc < 1.0 and min(base_alloc, vc["cap"]) > max_alloc:
+        final_alloc = round(max_alloc, 2)
+        reason = f"LAYER 0 MAX_ALLOC ({regime_label})"
     else:
         final_alloc = round(min(base_alloc, vc["cap"]), 2)
         reason = "NORMAL SIGNAL"
@@ -600,8 +705,51 @@ def run_apex(cfg: dict = None, verbose: bool = True) -> dict:
         w = 68
         print()
         print("═" * w)
-        print(f"  APEX Strategy  —  Signal Report  —  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        print(f"  APEX Strategy v3.0  —  Signal Report  —  {datetime.now().strftime('%Y-%m-%d %H:%M')}")
         print("═" * w)
+
+        # Layer 0 section
+        try:
+            import json as _json
+            snap = _json.load(open(cfg.get("margin_snap", MARGIN_SNAP)))
+            yoy_dir = snap.get("direction_yoy", "N/A")
+            qoq_dir = snap.get("direction_qoq", "N/A")
+            yoy_pp  = snap.get("yoy_change_pp", float("nan"))
+            qoq_pp  = snap.get("qoq_change_pp", float("nan"))
+            as_of   = snap.get("as_of_quarter", "unknown")
+            margin_loaded = True
+        except Exception:
+            yoy_dir = qoq_dir = "N/A"
+            yoy_pp  = qoq_pp  = float("nan")
+            as_of   = "—"
+            margin_loaded = False
+
+        yoy_score = MARGIN_SCORES.get(yoy_dir, 0)
+        qoq_score = MARGIN_SCORES.get(qoq_dir, 0) // 2
+        cape_pen  = -1 if CAPE_RATIO > 35 else 0
+        l0_score  = yoy_score + qoq_score + cape_pen
+
+        regime_icons = {"EXPANSION": "🟢", "NEUTRAL": "⚪", "CONTRACTION": "🔴"}
+        icon = regime_icons.get(regime_label, "⚪")
+
+        print(f"\n{'─'*w}")
+        print("  LAYER 0 — MACRO REGIME  (quarterly)")
+        print(f"{'─'*w}")
+        if not margin_loaded:
+            print("  ⚠️  No margin snapshot found. Run: python sp500_margin_tracker.py --save")
+            print(f"  Defaulting to NEUTRAL regime.")
+        else:
+            print(f"  Data as of quarter: {as_of}  |  CAPE: {CAPE_RATIO:.1f}")
+            print(f"  Margin YoY: {yoy_pp:+.3f} pp  →  {yoy_dir}  (score {yoy_score:+d})")
+            print(f"  Margin QoQ: {qoq_pp:+.3f} pp  →  {qoq_dir}  (score {qoq_score:+d})")
+            if cape_pen:
+                print(f"  CAPE > 35   → penalty {cape_pen:+d}")
+            print(f"  Layer 0 total: {l0_score:+d}")
+        print(f"\n  {icon}  REGIME: {regime_label}")
+        print(f"     target_vol={regime_params['target_vol']:.0%}  "
+              f"vix_threshold={regime_params['vix_threshold']}  "
+              f"dd_threshold={regime_params['dd_threshold']}%  "
+              f"max_alloc={max_alloc:.0%}")
 
         print(f"\n{'─'*w}")
         print("  LAYER 1 — CIRCUIT BREAKERS")
@@ -675,7 +823,7 @@ def run_apex(cfg: dict = None, verbose: bool = True) -> dict:
 
         print(f"  {interp}")
         print()
-        print("  ⚠ Confirm signal holds for 3 consecutive days before acting.")
+        print(f"  ⚠ Confirm signal holds for {cfg.get('confirm_days', 2)} consecutive days before acting.")
         print("  ⚠ Execute T+1 (next trading day open, after 10:00 AM).")
         print("  ⚠ This strategy is designed for Roth IRA accounts only.")
         print("  ⚠ NOT financial advice. Use at your own risk.")
@@ -696,6 +844,8 @@ def run_apex(cfg: dict = None, verbose: bool = True) -> dict:
         "trail_stop_fired" : ts["fired"],
         "signal_scores"    : sig["scores"],
         "signal_notes"     : sig["notes"],
+        "regime"           : regime_label,
+        "regime_params"    : regime_params,
         "timestamp"        : datetime.now().isoformat(),
     }
 
@@ -803,16 +953,24 @@ def print_weekly_checklist() -> None:
 # ══════════════════════════════════════════════════════════════════
 
 STRATEGY_SUMMARY = """
-APEX Strategy v2.0 — Quick Reference Card
+APEX Strategy v3.0 — Quick Reference Card
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-LAYER 1 — HARD STOPS (any triggers → VOO 100%)
-  • QQQ drawdown from 6-month high  > -10%   ← rolling high, not ATH
-  • VIX                             > 25
+LAYER 0 — MACRO REGIME  (quarterly, run sp500_margin_tracker.py --save)
+  Score = MARGIN_SCORES[yoy] + MARGIN_SCORES[qoq]//2 - 1(if CAPE>35)
+  Score ≥ 3  → EXPANSION:   vol=22% VIX-thresh=28 DD-thresh=-12% max=100%
+  Score ≤ -2 → CONTRACTION: vol=16% VIX-thresh=22 DD-thresh=-8%  max=50%
+  else       → NEUTRAL:     vol=20% VIX-thresh=25 DD-thresh=-10% max=100%
+  Margin direction scores: MAJOR_EXPANSION +4, EXPANSION +2, FLAT 0,
+                           CONTRACTION -2, MAJOR_CONTRACTION -4
+
+LAYER 1 — HARD STOPS (any triggers → VOO 100%)  [thresholds from Layer 0]
+  • QQQ drawdown from 6-month high  > dd_threshold  (default -10%)
+  • VIX                             > vix_threshold (default 25)
   • QQQ below SMA200                → bear regime
   (EMA death cross is Layer 2 only: -4 score penalty, NOT a hard stop)
 
-LAYER 2 — SIGNAL SCORING → BASE ALLOCATION  (9 dimensions)
+LAYER 2 — SIGNAL SCORING → BASE ALLOCATION  (10 dimensions, unchanged)
   Score ≤ 0  → 0%    (bearish)
   Score  1   → 20%   (cautious)
   Score  2-3 → 35-50% (neutral bull)
@@ -826,10 +984,9 @@ LAYER 2 — SIGNAL SCORING → BASE ALLOCATION  (9 dimensions)
   D7: 10Y rate 60d Δ (+1/-2)   D8: Drawdown depth (0/-3)
   D9: VIX 5d momentum (+2/-2)  D10: 10Y rate level (+1/-2)
 
-LAYER 3 — DYNAMIC VOLATILITY CAP
-  final = min(base_alloc, target_vol / TQQQ_realized_vol)
-  Bull regime (score ≥ 4 AND VIX < 20): target_vol = 25%
-  Otherwise:                             target_vol = 20%
+LAYER 3 — DYNAMIC VOLATILITY CAP  [target_vol from Layer 0]
+  final = min(base_alloc, target_vol / TQQQ_realized_vol, max_alloc)
+  Bull regime (score ≥ 4 AND VIX < 20): target_vol = +5pp (e.g. 25% in NEUTRAL)
   TQQQ realized vol = 15-day rolling daily std × √252
 
 TRAILING STOP (daily check)
@@ -838,8 +995,8 @@ TRAILING STOP (daily check)
 EXECUTION
   • Signal from Sunday close → Execute Monday 10AM
   • 3-day confirmation before any entry; 1-day to exit
+  • Update Layer 0 quarterly: python sp500_margin_tracker.py --save
   • Roth IRA only
-  • Account: Fidelity (or any broker with TQQQ/VOO)
 
 PERFORMANCE (backtest 2010–2026, no taxes)
   CAGR: 23.9%   Sharpe: 0.96   Max DD: -36.3%
