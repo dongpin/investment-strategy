@@ -12,11 +12,13 @@ import sys
 import os
 import json
 from datetime import datetime, timezone
+from typing import Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "strategy"))
 
 from apex_strategy import run_apex
 from nova_strategy import run_nova_bear_monitor
+from portfolio_tracker import run_portfolio_tracker, _TOP_N
 
 
 # ── Color palette ──────────────────────────────────────────────────────────
@@ -46,6 +48,9 @@ C = {
     "gray_text":    "#757575",
     "white":        "#FFFFFF",
     "black":        "#212121",
+    "teal_dark":    "#004D40",
+    "teal_med":     "#00695C",
+    "teal_light":   "#E0F2F1",
 }
 
 FONT = "font-family: -apple-system, 'Segoe UI', Arial, sans-serif;"
@@ -645,13 +650,348 @@ def build_nova_html(nova: dict) -> str:
     return "\n".join(rows)
 
 
+# ── Portfolio HTML builder ─────────────────────────────────────────────────
+
+def _quarter_label(report_date: str) -> str:
+    """Convert '2025-12-31' → 'Q4 2025'."""
+    try:
+        d = datetime.strptime(report_date, "%Y-%m-%d")
+        q = (d.month - 1) // 3 + 1
+        return f"Q{q} {d.year}"
+    except (ValueError, TypeError):
+        return report_date or ""
+
+
+def _fmt_m(value_m: float) -> str:
+    if value_m >= 1000:
+        return f"${value_m/1000:.1f}B"
+    return f"${value_m:.0f}M"
+
+
+def build_filings_digest_html(portfolio: dict) -> str:
+    """Compact one-row-per-filer summary card. Placed above the full diff."""
+    filers = portfolio.get("filers", [])
+    if not filers:
+        return ""
+
+    rows = []
+
+    rows.append(f"""
+    <tr>
+      <td colspan="5" style="background:{C['teal_dark']}; padding:12px 24px 10px;
+          border-radius:8px 8px 0 0;">
+        <span style="{FONT} font-size:14px; font-weight:700; color:#fff;">
+          📬 New 13F Filings
+        </span>
+        <span style="{FONT} font-size:11px; color:rgba(255,255,255,0.70); margin-left:10px;">
+          {len(filers)} filer{'s' if len(filers) != 1 else ''} filed within 60 days
+          &nbsp;·&nbsp; quarterly SEC disclosures
+        </span>
+      </td>
+    </tr>
+    <tr style="background:{C['teal_light']};">
+      <td style="{FONT} font-size:10px; font-weight:700; color:{C['teal_dark']};
+                 padding:5px 8px 5px 24px; text-transform:uppercase; letter-spacing:0.5px;">
+        Filer
+      </td>
+      <td style="{FONT} font-size:10px; font-weight:700; color:{C['teal_dark']};
+                 padding:5px 8px; text-transform:uppercase; letter-spacing:0.5px; white-space:nowrap;">
+        Period · Filed
+      </td>
+      <td style="{FONT} font-size:10px; font-weight:700; color:{C['teal_dark']};
+                 padding:5px 8px; text-transform:uppercase; letter-spacing:0.5px; text-align:right;">
+        AUM
+      </td>
+      <td style="{FONT} font-size:10px; font-weight:700; color:{C['teal_dark']};
+                 padding:5px 8px; text-transform:uppercase; letter-spacing:0.5px;">
+        Key Moves (vs prior quarter)
+      </td>
+      <td style="{FONT} font-size:10px; font-weight:700; color:{C['teal_dark']};
+                 padding:5px 14px 5px 8px; text-transform:uppercase; letter-spacing:0.5px; text-align:right;">
+        Data
+      </td>
+    </tr>""")
+
+    for i, f in enumerate(filers):
+        chg      = f.get("changes", {})
+        period   = _quarter_label(f.get("report_date", ""))
+        filed    = f.get("filed_date", "")
+        days_ago = f.get("days_ago", 0)
+        total_m  = f.get("total_value_m", 0)
+
+        # Pick up to 3 highlights: opened → closed → increased → decreased
+        highlights = []
+        for cat, color, symbol in [
+            ("opened",    C["green_dark"],  "+"),
+            ("closed",    C["red_dark"],    "−"),
+            ("increased", C["apex_blue"],   "↑"),
+            ("decreased", C["orange_dark"], "↓"),
+        ]:
+            pos = chg.get(cat, [])
+            if pos and len(highlights) < 3:
+                p  = pos[0]
+                nm = p["name"][:22]
+                pct_s = f"&thinsp;{p['pct']:+.0%}" if "pct" in p else ""
+                highlights.append(
+                    f'<span style="color:{color}; white-space:nowrap;">'
+                    f'{symbol}{nm}&thinsp;{_fmt_m(p["value_m"])}{pct_s}</span>'
+                )
+        if not highlights:
+            highlights = [f'<span style="color:{C["gray_text"]};">no changes</span>']
+
+        ok       = f.get("integrity_ok")
+        int_icon = "✓" if ok else ("⚠" if ok is False else "–")
+        int_col  = C["green_dark"] if ok else (C["orange_dark"] if ok is False else C["gray_text"])
+        row_bg   = C["white"] if i % 2 == 0 else C["gray_light"]
+
+        rows.append(f"""
+    <tr style="background:{row_bg}; border-top:1px solid {C['gray_border']};">
+      <td style="{FONT} font-size:12px; font-weight:700; color:{C['teal_dark']};
+                 padding:7px 8px 7px 24px; white-space:nowrap;">
+        {f['label']}
+        <br>
+        <span style="font-size:10px; font-weight:400; color:{C['gray_text']};">
+          {f['theme'].split('·')[0].strip()}
+        </span>
+      </td>
+      <td style="{FONT} font-size:11px; color:{C['black']}; padding:7px 8px; white-space:nowrap;">
+        <strong>{period}</strong><br>
+        <span style="color:{C['gray_text']};">filed&nbsp;{filed}&nbsp;({days_ago}d ago)</span>
+      </td>
+      <td style="{FONT} font-size:13px; font-weight:700; color:{C['teal_dark']};
+                 padding:7px 8px; text-align:right; white-space:nowrap;">
+        {_fmt_m(total_m)}
+      </td>
+      <td style="{FONT} font-size:11px; padding:7px 8px; line-height:1.7;">
+        {"&nbsp; &nbsp;".join(highlights)}
+      </td>
+      <td style="{FONT} font-size:11px; color:{int_col}; padding:7px 14px 7px 8px;
+                 text-align:right; white-space:nowrap; font-weight:700;">
+        {int_icon}&nbsp;SEC
+      </td>
+    </tr>""")
+
+    rows.append(f"""
+    <tr>
+      <td colspan="5" style="padding:6px 24px 10px; background:{C['gray_light']};
+          border-top:1px solid {C['gray_border']}; border-radius:0 0 8px 8px;">
+        <span style="{FONT} font-size:10px; color:{C['gray_text']};">
+          ↓ Full position diff below &nbsp;·&nbsp;
+          ✓ SEC = parsed total verified against SEC cover-page tableValueTotal &nbsp;·&nbsp;
+          cross-check at 13f.info
+        </span>
+      </td>
+    </tr>""")
+
+    return "\n".join(rows)
+
+
+def build_portfolio_html(portfolio: dict) -> str:
+    filers = portfolio.get("filers", [])
+    if not filers:
+        return ""
+
+    rows = []
+
+    # ── Section header ─────────────────────────────────────────────────────
+    rows.append(f"""
+    <tr>
+      <td colspan="3" style="background:linear-gradient(135deg,{C['teal_dark']},{C['teal_med']});
+          padding:18px 24px; border-radius:8px 8px 0 0;">
+        <table width="100%" cellpadding="0" cellspacing="0">
+          <tr>
+            <td>
+              <span style="{FONT} font-size:17px; font-weight:700; color:#fff;">
+                📊 Portfolio Tracker — 13F Filings
+              </span><br>
+              <span style="{FONT} font-size:11px; color:rgba(255,255,255,0.75);">
+                SEC EDGAR · quarterly disclosures · new filing within 60 days
+              </span>
+            </td>
+            <td style="text-align:right; white-space:nowrap;">
+              <span style="{FONT} font-size:18px; font-weight:800; color:#fff;">
+                {len(filers)} filer{'s' if len(filers) != 1 else ''}
+              </span><br>
+              <span style="{FONT} font-size:11px; color:rgba(255,255,255,0.75);">
+                with recent filing
+              </span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>""")
+
+    for i, f in enumerate(filers):
+        chg      = f.get("changes", {})
+        period   = _quarter_label(f.get("report_date", ""))
+        prev_per = _quarter_label(f.get("prev_report", ""))
+        filed    = f.get("filed_date", "")
+        days_ago = f.get("days_ago", 0)
+        total_m  = f.get("total_value_m", 0)
+        n_hold   = f.get("n_holdings", 0)
+
+        n_new  = len(chg.get("opened",    []))
+        n_cls  = len(chg.get("closed",    []))
+        n_inc  = len(chg.get("increased", []))
+        n_dec  = len(chg.get("decreased", []))
+        has_chg = n_new + n_cls + n_inc + n_dec > 0
+
+        integrity_ok   = f.get("integrity_ok")
+        integrity_note = f.get("integrity_note", "")
+        rep_total_m    = f.get("reported_total_m")
+
+        if integrity_ok is True:
+            integrity_badge = _badge("✓ SEC verified", C["green_med"])
+        elif integrity_ok is False:
+            integrity_badge = _badge(f"⚠ {integrity_note}", C["orange_dark"])
+        else:
+            integrity_badge = _badge("– not checked", C["gray_bar"], "#fff")
+
+        # Filer sub-header
+        rows.append(f"""
+    <tr>
+      <td colspan="3" style="background:{C['teal_light']}; padding:10px 24px 8px;
+          border-top:{'2px solid ' + C['teal_med'] if i > 0 else 'none'};">
+        <table width="100%" cellpadding="0" cellspacing="0">
+          <tr>
+            <td>
+              <span style="{FONT} font-size:13px; font-weight:700; color:{C['teal_dark']};">
+                {f['label']}
+              </span>
+              &nbsp;
+              <span style="{FONT} font-size:11px; color:{C['gray_text']};">
+                {f['name']}
+              </span>
+              <br>
+              <span style="{FONT} font-size:10px; color:{C['teal_med']}; font-weight:600;">
+                {f['theme']}
+              </span>
+            </td>
+            <td style="text-align:right; white-space:nowrap;">
+              <span style="{FONT} font-size:13px; font-weight:700; color:{C['teal_dark']};">
+                {_fmt_m(total_m)} &nbsp;·&nbsp; {n_hold} positions
+              </span>
+              <br>
+              <span style="{FONT} font-size:10px; color:{C['gray_text']};">
+                {period} &nbsp;·&nbsp; filed&nbsp;<strong>{filed}</strong>&nbsp;({days_ago}d ago)
+              </span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>""")
+
+        # Integrity + change summary row
+        badge_parts = [integrity_badge]
+        if n_new:  badge_parts.append(_badge(f"+{n_new} new",      C["green_med"]))
+        if n_cls:  badge_parts.append(_badge(f"−{n_cls} closed",   C["red_dark"]))
+        if n_inc:  badge_parts.append(_badge(f"↑{n_inc} increased",C["apex_blue"]))
+        if n_dec:  badge_parts.append(_badge(f"↓{n_dec} decreased",C["orange_dark"]))
+        if not has_chg:
+            badge_parts.append(_badge("no position changes", C["gray_bar"], "#fff"))
+
+        prev_label = (f"{prev_per} (filed&nbsp;{f['prev_date']})" if prev_per and f.get("prev_date")
+                      else "no prior filing")
+        rows.append(f"""
+    <tr>
+      <td colspan="3" style="padding:5px 24px 8px; background:{C['white']};">
+        <span style="{FONT} font-size:10px; color:{C['gray_text']};">
+          vs {prev_label}:&nbsp;&nbsp;
+        </span>
+        {"&nbsp; ".join(badge_parts)}
+      </td>
+    </tr>""")
+
+        if not has_chg:
+            continue
+
+        # Change detail rows
+        change_defs = [
+            ("opened",    "NEW",       C["green_bg"],  C["green_dark"],  "+"),
+            ("closed",    "CLOSED",    C["red_bg"],    C["red_dark"],    "−"),
+            ("increased", "INCREASED", C["apex_light"],C["apex_blue"],   "↑"),
+            ("decreased", "DECREASED", C["orange_bg"], C["orange_dark"], "↓"),
+        ]
+        for cat, cat_label, row_bg, row_fg, arrow in change_defs:
+            positions = chg.get(cat, [])
+            if not positions:
+                continue
+            shown  = positions[:_TOP_N]
+            more   = len(positions) - _TOP_N
+
+            rows.append(f"""
+    <tr>
+      <td colspan="3" style="padding:3px 24px 1px; background:{C['gray_light']};">
+        <span style="{FONT} font-size:10px; font-weight:700; color:{row_fg};
+              text-transform:uppercase; letter-spacing:0.5px;">
+          {arrow} {cat_label}
+          {f'<span style="font-weight:400; color:{C["gray_text"]};">(top {_TOP_N} of {len(positions)})</span>' if more > 0 else ''}
+        </span>
+      </td>
+    </tr>""")
+
+            for pos in shown:
+                pct_s = f"&nbsp;&nbsp;{pos['pct']:+.0%} shares" if "pct" in pos else ""
+                prev_s = (f"&nbsp;·&nbsp; prev {_fmt_m(pos['prev_value_m'])}"
+                          if "prev_value_m" in pos else "")
+                rows.append(f"""
+    <tr style="background:{row_bg};">
+      <td style="padding:4px 24px 4px 28px; {FONT} font-size:12px;
+                 color:{C['black']}; width:55%;">
+        {pos['name']}
+      </td>
+      <td style="padding:4px 8px; {FONT} font-size:12px;
+                 font-weight:600; color:{row_fg}; white-space:nowrap;">
+        {_fmt_m(pos['value_m'])}
+      </td>
+      <td style="padding:4px 14px 4px 4px; {FONT} font-size:11px;
+                 color:{C['gray_text']}; white-space:nowrap;">
+        {pct_s}{prev_s}
+      </td>
+    </tr>""")
+
+    # Footer note
+    rows.append(f"""
+    <tr>
+      <td colspan="3" style="padding:10px 24px 14px; border-top:1px solid {C['gray_border']};">
+        <span style="{FONT} font-size:10px; color:{C['gray_text']};">
+          ⚠&nbsp; 13F filings are quarterly (45-day lag after quarter end) ·
+          long equity only — options &amp; short positions not shown ·
+          cross-check at 13f.info · not financial advice
+        </span>
+      </td>
+    </tr>""")
+
+    return "\n".join(rows)
+
+
 # ── Full HTML email ────────────────────────────────────────────────────────
 
-def build_html_email(apex: dict, nova: dict, context: str) -> str:
+def build_html_email(apex: dict, nova: dict, context: str,
+                     portfolio: Optional[dict] = None) -> str:
     now_str    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     apex_html  = build_apex_html(apex)
     nova_html  = build_nova_html(nova)
     nova_level = nova.get("confirmed_level", 0)
+
+    digest_inner    = build_filings_digest_html(portfolio or {})
+    portfolio_inner = build_portfolio_html(portfolio or {})
+
+    def _card(inner: str) -> str:
+        return f"""<tr>
+    <td style="background:{C['white']}; border-radius:8px;
+               box-shadow:0 2px 6px rgba(0,0,0,0.08); overflow:hidden;">
+      <table width="100%" cellpadding="0" cellspacing="0">
+        {inner}
+      </table>
+    </td>
+  </tr>"""
+
+    spacer          = '<tr><td style="height:16px;"></td></tr>'
+    digest_card     = (_card(digest_inner)    if digest_inner    else "")
+    digest_spacer   = (spacer                 if digest_inner    else "")
+    portfolio_card  = (_card(portfolio_inner) if portfolio_inner else "")
+    portfolio_spacer= (spacer                 if portfolio_inner else "")
 
     apex_circuit = apex.get("circuit_triggered", False)
     apex_trail   = apex.get("trail_stop_fired",  False)
@@ -735,6 +1075,16 @@ def build_html_email(apex: dict, nova: dict, context: str) -> str:
     </td>
   </tr>
 
+  {digest_spacer}
+
+  <!-- ── New 13F Filings digest (compact, one row per filer) ── -->
+  {digest_card}
+
+  {portfolio_spacer}
+
+  <!-- ── Portfolio card — full position diff ── -->
+  {portfolio_card}
+
   <!-- Footer -->
   <tr>
     <td style="padding:14px 0 6px; text-align:center;
@@ -758,11 +1108,16 @@ def main():
     context = run_context()
 
     with contextlib.redirect_stdout(sys.stderr):
-        apex = run_apex(verbose=False)
-        nova = run_nova_bear_monitor(verbose=False)
+        apex      = run_apex(verbose=False)
+        nova      = run_nova_bear_monitor(verbose=False)
+        try:
+            portfolio = run_portfolio_tracker(verbose=True)
+        except Exception as e:
+            print(f"Portfolio tracker failed: {e}", file=sys.stderr)
+            portfolio = {"filers": []}
 
     subject = build_subject(apex, nova, context)
-    body    = build_html_email(apex, nova, context)
+    body    = build_html_email(apex, nova, context, portfolio)
 
     print(json.dumps({"subject": subject, "body": body}))
 

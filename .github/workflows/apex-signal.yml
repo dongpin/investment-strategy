@@ -53,7 +53,13 @@ jobs:
         run: python soxx_cycle_tracker.py --save
         continue-on-error: true
 
-      # ── 5. Build combined HTML email (subject + body) ──────────────
+      # ── 5. Check 13F portfolio filings (logged here; also runs inside email builder) ──
+      - name: Check portfolio 13F filings
+        working-directory: strategy
+        run: python portfolio_tracker.py
+        continue-on-error: true
+
+      # ── 6. Build combined HTML email (subject + body) ─────────────
       - name: Build email
         id: email
         working-directory: notifications
@@ -74,7 +80,7 @@ jobs:
           print(f"Body length: {len(body)} chars")
           PYEOF
 
-      # ── 6. Send combined HTML email ────────────────────────────────
+      # ── 7. Send combined HTML email ────────────────────────────────
       - name: Send email
         uses: dawidd6/action-send-mail@v3
         with:
