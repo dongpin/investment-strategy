@@ -74,17 +74,7 @@ jobs:
           print(f"Body length: {len(body)} chars")
           PYEOF
 
-      # ── 6. Read HTML body ──────────────────────────────────────────
-      - name: Read email body
-        id: body
-        run: |
-          {
-            echo 'html<<HTMLEOF'
-            cat /tmp/email_body.html
-            echo 'HTMLEOF'
-          } >> "$GITHUB_OUTPUT"
-
-      # ── 7. Send combined HTML email ────────────────────────────────
+      # ── 6. Send combined HTML email ────────────────────────────────
       - name: Send email
         uses: dawidd6/action-send-mail@v3
         with:
@@ -96,4 +86,4 @@ jobs:
           subject: ${{ steps.email.outputs.subject }}
           to: dongpin@hotmail.com
           from: Investment Signals <${{ secrets.GMAIL_USER }}>
-          html_body: ${{ steps.body.outputs.html }}
+          html_body: file:///tmp/email_body.html
