@@ -90,6 +90,6 @@ jobs:
           username: ${{ secrets.GMAIL_USER }}
           password: ${{ secrets.GMAIL_APP_PASSWORD }}
           subject: ${{ steps.email.outputs.subject }}
-          to: dongpin@hotmail.com
+          to: ${{ vars.EMAIL_TO }}
           from: Investment Signals <${{ secrets.GMAIL_USER }}>
           html_body: file:///tmp/email_body.html
